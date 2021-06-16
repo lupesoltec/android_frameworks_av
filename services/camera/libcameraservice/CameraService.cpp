@@ -257,9 +257,21 @@ void CameraService::pingCameraServiceProxy() {
 }
 
 void CameraService::broadcastTorchModeStatus(const String8& cameraId, TorchModeStatus status) {
+    SystemCameraKind systemCameraKind = SystemCameraKind::PUBLIC;
+    status_t res = getSystemCameraKind(cameraId, &systemCameraKind);
+    if (res != OK) {
+        ALOGE("%s: Could not get system camera kind for camera id %s", __FUNCTION__,
+                cameraId.string());
+        return;
+    }
     Mutex::Autolock lock(mStatusListenerLock);
-
     for (auto& i : mListenerList) {
+        if (shouldSkipStatusUpdates(systemCameraKind, i->isVendorListener(), i->getListenerPid(),
+                i->getListenerUid())) {
+            ALOGV("Skipping torch callback for system-only camera device %s",
+                    cameraId.c_str());
+            continue;
+        }
         i->getListener()->onTorchStatusChanged(mapToInterface(status), String16{cameraId});
     }
 }
@@ -560,7 +572,6 @@ void CameraService::onTorchStatusChangedLocked(const String8& cameraId,
             }
         }
     }
-
     broadcastTorchModeStatus(cameraId, newStatus);
 }
 
@@ -1632,6 +1643,12 @@ Status CameraService::connectHelper(const sp<CALLBACK>& cameraCb, const String8&
 
     int originalClientPid = 0;
 
+    // If the upper layer does not assign HAL version with API 1, then set HAL1 by default
+    if (strcmp(clientName8.string(), String8("com.oneplus.camera")) == 0 && 
+            effectiveApiLevel == API_1 && halVersion== CAMERA_HAL_API_VERSION_UNSPECIFIED) {
+        halVersion = CAMERA_DEVICE_API_VERSION_1_0;
+    }
+
     ALOGI("CameraService::connect call (PID %d \"%s\", camera ID %s) for HAL version %s and "
             "Camera API version %d", clientPid, clientName8.string(), cameraId.string(),
             (halVersion == -1) ? "default" : std::to_string(halVersion).c_str(),
@@ -1875,6 +1892,10 @@ Status CameraService::setTorchMode(const String16& cameraId, bool enabled,
     String8 id = String8(cameraId.string());
     int uid = CameraThreadState::getCallingUid();
 
+    if (shouldRejectSystemCameraConnection(id)) {
+        return STATUS_ERROR_FMT(ERROR_ILLEGAL_ARGUMENT, "Unable to set torch mode"
+                " for system only device %s: ", id.string());
+    }
     // verify id is valid.
     auto state = getCameraState(id);
     if (state == nullptr) {
@@ -2231,6 +2252,11 @@ Status CameraService::addListenerHelper(const sp<ICameraServiceListener>& listen
                     return shouldSkipStatusUpdates(deviceKind, isVendorListener, clientPid,
                             clientUid);}), cameraStatuses->end());
 
+    //cameraStatuses will have non-eligible camera ids removed.
+    std::set<String16> idsChosenForCallback;
+    for (const auto &s : *cameraStatuses) {
+        idsChosenForCallback.insert(String16(s.cameraId));
+    }
 
     /*
      * Immediately signal current torch status to this listener only
@@ -2240,7 +2266,11 @@ Status CameraService::addListenerHelper(const sp<ICameraServiceListener>& listen
         Mutex::Autolock al(mTorchStatusMutex);
         for (size_t i = 0; i < mTorchStatusMap.size(); i++ ) {
             String16 id = String16(mTorchStatusMap.keyAt(i).string());
-            listener->onTorchStatusChanged(mapToInterface(mTorchStatusMap.valueAt(i)), id);
+            // The camera id is visible to the client. Fine to send torch
+            // callback.
+            if (idsChosenForCallback.find(id) != idsChosenForCallback.end()) {
+                listener->onTorchStatusChanged(mapToInterface(mTorchStatusMap.valueAt(i)), id);
+            }
         }
     }
 
